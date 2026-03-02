@@ -20,8 +20,8 @@ class MailClient:
             logging.error(f"Error logging in: {e}")
             return False
 
-    def logout(self, mail):
-        mail.logout()
+    def logout(self):
+        self.logout()
         print("Logged out successfully")
         logging.info(f"Logged out of {self.server}:{self.port} -> {self.username}")
     

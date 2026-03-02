@@ -1,6 +1,6 @@
 import logging
-from .modules.mailClient import MailClient
-from .modules.mailParser import MailParser
+from OpenDeMail.modules.mailClient import MailClient
+from OpenDeMail.modules.mailParser import MailParser
 
 # Set up logging
 # Create logfile if it doesn't exist and log to it
