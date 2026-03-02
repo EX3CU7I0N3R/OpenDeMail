@@ -3,17 +3,23 @@ from modules.mailClient import MailClient
 from modules.mailParser import MailParser
 import dotenv
 import os
+import logging
 
 dotenv.load_dotenv()
 username = os.getenv("EMAIL_USERNAME")
 password = os.getenv("EMAIL_PASSWORD")
+server = os.getenv("EMAIL_SERVER")
+port = int(os.getenv("EMAIL_PORT"))
+logging.info("Environment variables loaded successfully")
+
 def main() -> None:
-    LoginClient = MailClient().login(username, password)
+    LoginClient = MailClient(server=server, port=port).login(username, password)
     if LoginClient:
-        print("Login successful!")
+        logging.info("Login successful!")
         mail_parser = MailParser(LoginClient)
         latest_email = mail_parser.get_latest_email()
-        print(latest_email)
+        total_emails = mail_parser.get_total_emails()
+        logging.info(f"Total emails: {total_emails}")
 
 if __name__ == "__main__":
     main()
