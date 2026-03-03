@@ -1,6 +1,6 @@
 # simple entry point for the OpenDeMail application
-from modules.mailClient import MailClient
-from modules.mailParser import MailParser
+from .modules.mailClient import MailClient
+from .modules.mailParser import MailParser
 import dotenv
 import os
 import logging
