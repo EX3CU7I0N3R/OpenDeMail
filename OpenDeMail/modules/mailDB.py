@@ -3,6 +3,7 @@ import logging
 import re
 import sqlite3
 from email.utils import parseaddr
+from typing import Iterable
 
 
 class MailDB:
@@ -168,4 +169,21 @@ class MailDB:
             return cursor.fetchall()
         except sqlite3.Error as exc:
             logging.error("Error fetching emails: %s", exc)
+            raise
+
+    def bulk_update_classification(self, updates: Iterable[tuple[int, str, str]]) -> None:
+        try:
+            cursor = self.conn.cursor()
+            cursor.executemany(
+                """
+                UPDATE emails
+                SET processed_category = ?, processed_flag = ?
+                WHERE id = ?
+                """,
+                ((category, flag, email_id) for email_id, category, flag in updates),
+            )
+            self.conn.commit()
+            logging.info("Updated classification metadata for %s emails", cursor.rowcount)
+        except sqlite3.Error as exc:
+            logging.error("Error updating classification metadata: %s", exc)
             raise
