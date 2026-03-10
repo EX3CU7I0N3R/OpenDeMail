@@ -25,6 +25,16 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+PROMO_PATTERN = re.compile(
+    r"\b(verify|urgent|winner|offer|save|free|discount|limited|sale|special|alert|deal|bonus|reward|cashback)\b",
+    re.IGNORECASE,
+)
+PHISHING_PATTERN = re.compile(
+    r"\b(password|account|login|click|confirm|suspend|reset|otp|security|bank|payment|invoice|gift)\b",
+    re.IGNORECASE,
+)
+FREE_MAILBOX_DOMAINS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com"}
+
 
 class EmailClassifier:
     def __init__(self, db_path: str = "emails.db", output_dir: str = "classification_output") -> None:
@@ -65,18 +75,38 @@ class EmailClassifier:
             return ""
         return str(value).strip()
 
+    @staticmethod
+    def _extract_top_terms(subjects: pd.Series) -> list[str]:
+        tokens = [
+            token
+            for token in re.findall(r"[a-z]{4,}", " ".join(subjects.astype(str).tolist()).lower())
+            if token not in {"from", "with", "your", "this", "have", "that", "today", "email"}
+        ]
+        if not tokens:
+            return []
+        return pd.Series(tokens).value_counts().head(5).index.tolist()
+
     def prepare_features(self, frame: pd.DataFrame):
         working = frame.copy()
-        working["sender_domain"] = working["sender_domain"].fillna("").str.lower()
-        working["sender_email"] = working["sender_email"].fillna("").str.lower()
-        working["subject"] = working["subject"].fillna("")
-        working["mailer"] = working["mailer"].fillna("")
-        working["content_type"] = working["content_type"].fillna("")
-        working["spf_result"] = working["spf_result"].fillna("none").str.lower()
-        working["dkim_result"] = working["dkim_result"].fillna("none").str.lower()
-        working["dmarc_result"] = working["dmarc_result"].fillna("none").str.lower()
-        working["received"] = working["received"].fillna("")
-        working["x_received"] = working["x_received"].fillna("")
+        for column in [
+            "sender_domain",
+            "sender_email",
+            "subject",
+            "mailer",
+            "content_type",
+            "spf_result",
+            "dkim_result",
+            "dmarc_result",
+            "received",
+            "x_received",
+        ]:
+            working[column] = working[column].fillna("")
+
+        working["sender_domain"] = working["sender_domain"].str.lower()
+        working["sender_email"] = working["sender_email"].str.lower()
+        working["spf_result"] = working["spf_result"].str.lower()
+        working["dkim_result"] = working["dkim_result"].str.lower()
+        working["dmarc_result"] = working["dmarc_result"].str.lower()
 
         working["subject_token_count"] = working["subject"].str.split().str.len().fillna(0)
         working["received_hops"] = working["received"].str.count("\n").fillna(0) + 1
@@ -86,12 +116,17 @@ class EmailClassifier:
         working["spf_pass"] = working["spf_result"].eq("pass").astype(int)
         working["dkim_pass"] = working["dkim_result"].eq("pass").astype(int)
         working["dmarc_pass"] = working["dmarc_result"].eq("pass").astype(int)
-
-        suspicious_terms = re.compile(
-            r"\b(verify|urgent|winner|offer|save|free|discount|limited|sale|special|alert|deal)\b",
-            re.IGNORECASE,
+        working["promo_term_hits"] = working["subject"].str.count(PROMO_PATTERN).fillna(0)
+        working["phishing_term_hits"] = working["subject"].str.count(PHISHING_PATTERN).fillna(0)
+        working["exclamation_count"] = working["subject"].str.count("!").fillna(0)
+        working["uppercase_ratio"] = working["subject"].map(
+            lambda text: (
+                sum(1 for char in str(text) if char.isupper()) / max(sum(1 for char in str(text) if char.isalpha()), 1)
+            )
         )
-        working["promo_term_hits"] = working["subject"].str.count(suspicious_terms).fillna(0)
+        working["is_html"] = working["content_type"].str.contains("html", case=False, regex=False).astype(int)
+        working["free_mailbox_sender"] = working["sender_domain"].isin(FREE_MAILBOX_DOMAINS).astype(int)
+        working["unknown_sender_domain"] = working["sender_domain"].eq("").astype(int)
 
         working["combined_text"] = (
             working["subject"].map(self._safe_text)
@@ -122,6 +157,12 @@ class EmailClassifier:
                     "dkim_pass",
                     "dmarc_pass",
                     "promo_term_hits",
+                    "phishing_term_hits",
+                    "exclamation_count",
+                    "uppercase_ratio",
+                    "is_html",
+                    "free_mailbox_sender",
+                    "unknown_sender_domain",
                 ]
             ].to_numpy(dtype=float)
         )
@@ -151,30 +192,76 @@ class EmailClassifier:
     @staticmethod
     def _summarize_cluster_name(cluster_frame: pd.DataFrame) -> str:
         top_domain = cluster_frame["sender_domain"].replace("", "unknown").mode().iloc[0]
+        top_terms = EmailClassifier._extract_top_terms(cluster_frame["subject"])
+        keyword = top_terms[0] if top_terms else "general"
+        pass_rate = cluster_frame[["spf_pass", "dkim_pass", "dmarc_pass"]].mean().mean()
+        promo_rate = cluster_frame["promo_term_hits"].gt(0).mean()
+        phishing_rate = cluster_frame["phishing_term_hits"].gt(0).mean()
 
-        subjects = " ".join(cluster_frame["subject"].astype(str).tolist()).lower()
-        tokens = [
-            token
-            for token in re.findall(r"[a-z]{4,}", subjects)
-            if token not in {"from", "with", "your", "this", "have", "that", "today", "email"}
-        ]
-        token_hint = pd.Series(tokens).value_counts().head(1)
-        keyword = token_hint.index[0] if not token_hint.empty else "general"
-
-        pass_rate = (
-            cluster_frame[["spf_pass", "dkim_pass", "dmarc_pass"]].mean().mean()
-            if len(cluster_frame) > 0
-            else 0.0
-        )
-        promo_rate = cluster_frame["promo_term_hits"].gt(0).mean() if len(cluster_frame) > 0 else 0.0
-
-        if pass_rate < 0.45:
+        if pass_rate < 0.45 or phishing_rate > 0.30:
             prefix = "unverified"
-        elif promo_rate > 0.4:
+        elif promo_rate > 0.40:
             prefix = "marketing"
         else:
             prefix = "transactional"
         return f"{prefix}_{top_domain}_{keyword}"
+
+    @staticmethod
+    def _score_single_email(row: pd.Series) -> tuple[float, str, str]:
+        score = 0.0
+        reasons = []
+
+        if not row["spf_pass"]:
+            score += 1.4
+            reasons.append("SPF did not pass")
+        if not row["dkim_pass"]:
+            score += 1.4
+            reasons.append("DKIM did not pass")
+        if not row["dmarc_pass"]:
+            score += 1.2
+            reasons.append("DMARC did not pass")
+        if row["promo_term_hits"] > 0:
+            score += min(1.8, 0.6 * float(row["promo_term_hits"]))
+            reasons.append(f"Promotional language detected ({int(row['promo_term_hits'])} hit(s))")
+        if row["phishing_term_hits"] > 0:
+            score += min(2.1, 0.7 * float(row["phishing_term_hits"]))
+            reasons.append(f"Security/payment keywords detected ({int(row['phishing_term_hits'])} hit(s))")
+        if row["received_hops"] >= 4:
+            score += 0.6
+            reasons.append("High number of mail transfer hops")
+        if row["exclamation_count"] >= 2:
+            score += 0.5
+            reasons.append("Aggressive punctuation in subject")
+        if row["uppercase_ratio"] >= 0.45 and row["subject_token_count"] >= 3:
+            score += 0.5
+            reasons.append("High uppercase ratio in subject")
+        if row["free_mailbox_sender"] and row["promo_term_hits"] > 0:
+            score += 0.6
+            reasons.append("Free mailbox domain used with promotional subject")
+        if row["unknown_sender_domain"]:
+            score += 0.7
+            reasons.append("Sender domain missing")
+        if row["is_html"] and row["promo_term_hits"] > 0:
+            score += 0.4
+            reasons.append("HTML email combined with promotional content")
+        if str(row["processed_category"]).startswith("unverified_"):
+            score += 0.8
+            reasons.append("Cluster behaves like an unverified sender group")
+        elif str(row["processed_category"]).startswith("marketing_"):
+            score += 0.4
+            reasons.append("Cluster behaves like a marketing sender group")
+
+        normalized_score = round(min(100.0, (score / 8.5) * 100.0), 2)
+        if normalized_score >= 70:
+            label = "likely_spam"
+        elif normalized_score >= 40:
+            label = "suspicious"
+        else:
+            label = "likely_ham"
+
+        if not reasons:
+            reasons.append("No strong spam indicators were triggered")
+        return normalized_score, label, "; ".join(reasons)
 
     def classify(self, frame: pd.DataFrame):
         working, feature_matrix, vectorizer = self.prepare_features(frame)
@@ -189,15 +276,11 @@ class EmailClassifier:
 
         working["processed_category"] = working["cluster_id"].map(cluster_name_map)
 
-        working["risk_score"] = (
-            (1 - working["spf_pass"])
-            + (1 - working["dkim_pass"])
-            + (1 - working["dmarc_pass"])
-            + working["received_hops"].ge(4).astype(int)
-            + working["promo_term_hits"].ge(2).astype(int)
-        )
+        spam_results = working.apply(self._score_single_email, axis=1, result_type="expand")
+        spam_results.columns = ["spam_score", "spam_label", "spam_reasons"]
+        working[["spam_score", "spam_label", "spam_reasons"]] = spam_results
         working["processed_flag"] = np.where(
-            working["risk_score"] >= 3,
+            working["spam_label"].isin(["likely_spam", "suspicious"]),
             "review",
             "normal",
         )
@@ -218,7 +301,9 @@ class EmailClassifier:
     def persist_results(self, classified_frame: pd.DataFrame) -> None:
         db = MailDB(self.db_path)
         try:
-            updates = classified_frame[["id", "processed_category", "processed_flag"]].itertuples(index=False, name=None)
+            updates = classified_frame[
+                ["id", "processed_category", "processed_flag", "spam_score", "spam_label", "spam_reasons"]
+            ].itertuples(index=False, name=None)
             db.bulk_update_classification(updates)
         finally:
             db.close()
@@ -226,8 +311,15 @@ class EmailClassifier:
     def save_artifacts(self, classified_frame: pd.DataFrame, cluster_name_map: dict, top_terms_per_cluster: dict) -> dict:
         summary = {
             "total_emails": int(len(classified_frame)),
-            "clusters": [],
             "review_flagged": int((classified_frame["processed_flag"] == "review").sum()),
+            "spam_label_counts": classified_frame["spam_label"].value_counts().to_dict(),
+            "clusters": [],
+            "spam_decision_rules": [
+                "Authentication failures increase score the most.",
+                "Promotional and phishing keywords increase score.",
+                "Routing complexity, aggressive punctuation, uppercase-heavy subjects, and unknown sender identity increase score.",
+                "Cluster context can add a small penalty when a message belongs to an unverified or marketing-heavy group.",
+            ],
         }
 
         cluster_summary = (
@@ -238,7 +330,10 @@ class EmailClassifier:
                 avg_spf_pass=("spf_pass", "mean"),
                 avg_dkim_pass=("dkim_pass", "mean"),
                 avg_dmarc_pass=("dmarc_pass", "mean"),
-                flagged_for_review=("processed_flag", lambda x: int((x == "review").sum())),
+                avg_spam_score=("spam_score", "mean"),
+                likely_spam=("spam_label", lambda x: int((x == "likely_spam").sum())),
+                suspicious=("spam_label", lambda x: int((x == "suspicious").sum())),
+                likely_ham=("spam_label", lambda x: int((x == "likely_ham").sum())),
             )
             .reset_index()
             .sort_values("email_count", ascending=False)
@@ -248,10 +343,14 @@ class EmailClassifier:
             record["top_terms"] = top_terms_per_cluster.get(int(record["cluster_id"]), [])
             summary["clusters"].append(record)
 
-        summary_path = self.output_dir / "classification_summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        top_suspicious = classified_frame.sort_values("spam_score", ascending=False).head(15)
+        summary["top_suspicious_examples"] = top_suspicious[
+            ["id", "message_id", "sender_domain", "subject", "spam_score", "spam_label", "spam_reasons"]
+        ].to_dict(orient="records")
 
-        top_records = classified_frame[
+        (self.output_dir / "classification_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+        export_frame = classified_frame[
             [
                 "id",
                 "message_id",
@@ -259,16 +358,21 @@ class EmailClassifier:
                 "subject",
                 "processed_category",
                 "processed_flag",
-                "risk_score",
+                "spam_score",
+                "spam_label",
+                "spam_reasons",
                 "cluster_id",
             ]
         ].copy()
-        top_records.to_csv(self.output_dir / "classified_emails.csv", index=False)
+        export_frame.to_csv(self.output_dir / "classified_emails.csv", index=False)
 
         self._plot_cluster_distribution(cluster_summary)
         self._plot_projection(classified_frame)
         self._plot_auth_rates(classified_frame)
         self._plot_top_domains(classified_frame)
+        self._plot_spam_label_distribution(classified_frame)
+        self._plot_spam_score_histogram(classified_frame)
+        self._plot_spam_by_category(classified_frame)
         self._write_explanation(summary, cluster_name_map, top_terms_per_cluster)
         return summary
 
@@ -331,20 +435,97 @@ class EmailClassifier:
         plt.savefig(self.output_dir / "top_sender_domains.png", dpi=180)
         plt.close()
 
+    def _plot_spam_label_distribution(self, classified_frame: pd.DataFrame) -> None:
+        counts = classified_frame["spam_label"].value_counts().reindex(["likely_ham", "suspicious", "likely_spam"], fill_value=0)
+        plt.figure(figsize=(8, 5))
+        plt.bar(counts.index, counts.values, color=["#4d908e", "#f9c74f", "#f94144"])
+        plt.ylabel("Email count")
+        plt.title("Spam classifier label distribution")
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "spam_label_distribution.png", dpi=180)
+        plt.close()
+
+    def _plot_spam_score_histogram(self, classified_frame: pd.DataFrame) -> None:
+        plt.figure(figsize=(9, 5))
+        plt.hist(classified_frame["spam_score"], bins=20, color="#577590", edgecolor="white")
+        plt.xlabel("Spam score")
+        plt.ylabel("Email count")
+        plt.title("Spam score distribution")
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "spam_score_histogram.png", dpi=180)
+        plt.close()
+
+    def _plot_spam_by_category(self, classified_frame: pd.DataFrame) -> None:
+        category_spam = (
+            classified_frame.groupby(["processed_category", "spam_label"])["id"]
+            .count()
+            .unstack(fill_value=0)
+            .reindex(columns=["likely_ham", "suspicious", "likely_spam"], fill_value=0)
+        )
+        category_spam.plot(
+            kind="bar",
+            stacked=True,
+            figsize=(10, 6),
+            color=["#4d908e", "#f9c74f", "#f94144"],
+        )
+        plt.ylabel("Email count")
+        plt.title("Spam labels within each predicted category")
+        plt.xticks(rotation=30, ha="right")
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "spam_by_category.png", dpi=180)
+        plt.close()
+
     def _write_explanation(self, summary: dict, cluster_name_map: dict, top_terms_per_cluster: dict) -> None:
+        suspicious_count = summary["spam_label_counts"].get("suspicious", 0)
+        spam_count = summary["spam_label_counts"].get("likely_spam", 0)
+        ham_count = summary["spam_label_counts"].get("likely_ham", 0)
+
         lines = [
-            "# Classification Overview",
+            "# Classification And Spam Detection Overview",
+            "",
+            "## What The Pipeline Does",
+            "",
+            "1. Load every email header record from `emails.db`.",
+            "2. Build clustering features from subject text, sender identity, content type, authentication results, and routing depth.",
+            "3. Group similar emails with KMeans so the mailbox is segmented into behavioral categories.",
+            "4. Name each cluster using its dominant domain, strongest subject keyword, and overall trust pattern.",
+            "5. Run a spam scoring layer on top of each email using deterministic risk rules.",
+            "6. Save the category, spam label, spam score, and spam reasons back into SQLite.",
+            "",
+            "## Decision Logic",
+            "",
+            "- Clustering is unsupervised. It groups similar emails without using manual labels.",
+            "- `processed_category` explains the cluster the email belongs to.",
+            "- `spam_score` is a 0-100 risk score built from weighted rules, not a trained probability.",
+            "- `spam_label` is derived from `spam_score`: `likely_ham` < 40, `suspicious` 40-69.99, `likely_spam` >= 70.",
+            "- `processed_flag` becomes `review` for both `suspicious` and `likely_spam` messages.",
+            "",
+            "## Main Spam Signals",
+            "",
+            "- Authentication failures: SPF, DKIM, and DMARC misses carry the heaviest penalties.",
+            "- Subject language: promotional words, security/payment terms, excessive exclamation, and uppercase-heavy subjects raise the score.",
+            "- Routing shape: many mail hops add risk because they often indicate forwarding chains or indirect delivery.",
+            "- Sender identity: missing sender domain or a free mailbox paired with promotional language adds risk.",
+            "- Cluster context: messages inside an `unverified_*` or `marketing_*` cluster receive a small extra penalty.",
+            "",
+            "## Current Run",
             "",
             f"- Total emails analyzed: {summary['total_emails']}",
-            f"- Emails flagged for review: {summary['review_flagged']}",
-            f"- Number of predicted clusters: {len(cluster_name_map)}",
+            f"- Likely ham: {ham_count}",
+            f"- Suspicious: {suspicious_count}",
+            f"- Likely spam: {spam_count}",
+            f"- Review queue size: {summary['review_flagged']}",
+            f"- Number of clusters: {len(cluster_name_map)}",
             "",
             "## Graph Guide",
             "",
-            "- `cluster_distribution.png`: shows how the mailbox splits across predicted categories. Taller bars indicate the dominant email behavior groups.",
-            "- `cluster_projection.png`: shows each email compressed into two dimensions. Tight groups suggest coherent patterns; overlap suggests similar message types.",
-            "- `auth_rates_by_category.png`: compares SPF, DKIM, and DMARC pass ratios by category. Lower bars indicate weaker sender verification.",
-            "- `top_sender_domains.png`: highlights which domains contribute the most traffic overall.",
+            "- `cluster_distribution.png`: mailbox volume per predicted category.",
+            "- `cluster_projection.png`: two-dimensional projection of all emails; each point is one email colored by cluster.",
+            "- `auth_rates_by_category.png`: average SPF/DKIM/DMARC pass rates for each cluster.",
+            "- `top_sender_domains.png`: top domains contributing mailbox traffic.",
+            "- `spam_label_distribution.png`: how many emails were marked ham, suspicious, or spam.",
+            "- `spam_score_histogram.png`: where scores concentrate across the full mailbox.",
+            "- `spam_by_category.png`: stacked view of spam labels within each predicted category.",
             "",
             "## Cluster Notes",
             "",
@@ -354,7 +535,15 @@ class EmailClassifier:
             cluster_id = int(cluster["cluster_id"])
             lines.append(
                 f"- `{cluster['processed_category']}`: {cluster['email_count']} emails, dominant domain `{cluster['dominant_domain']}`, "
-                f"review-flagged `{cluster['flagged_for_review']}`, top terms {top_terms_per_cluster.get(cluster_id, [])}."
+                f"avg spam score `{cluster['avg_spam_score']:.2f}`, spam `{cluster['likely_spam']}`, suspicious `{cluster['suspicious']}`, "
+                f"top terms {top_terms_per_cluster.get(cluster_id, [])}."
+            )
+
+        lines.extend(["", "## Highest-Risk Examples", ""])
+        for record in summary["top_suspicious_examples"][:10]:
+            lines.append(
+                f"- Row `{record['id']}` from `{record['sender_domain']}` scored `{record['spam_score']}` as `{record['spam_label']}` "
+                f"for subject `{record['subject']}` because: {record['spam_reasons']}."
             )
 
         (self.output_dir / "classification_explanation.md").write_text("\n".join(lines), encoding="utf-8")

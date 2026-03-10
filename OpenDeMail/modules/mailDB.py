@@ -44,9 +44,20 @@ class MailDB:
         raw_headers_json TEXT NOT NULL,
         processed_category TEXT,
         processed_flag TEXT,
+        spam_score REAL,
+        spam_label TEXT,
+        spam_reasons TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """
+
+    REQUIRED_COLUMNS = {
+        "processed_category": "TEXT",
+        "processed_flag": "TEXT",
+        "spam_score": "REAL",
+        "spam_label": "TEXT",
+        "spam_reasons": "TEXT",
+    }
 
     def __init__(self, db_name: str = "emails.db"):
         self.db_name = db_name
@@ -57,11 +68,22 @@ class MailDB:
         try:
             cursor = self.conn.cursor()
             cursor.execute(self.CREATE_TABLE_IF_NOT_EXISTS_SQL)
+            self._ensure_required_columns(cursor)
             self.conn.commit()
             logging.info("Database table ready: %s", self.db_name)
         except sqlite3.Error as exc:
             logging.error("Error creating database table: %s", exc)
             raise
+
+    def _ensure_required_columns(self, cursor: sqlite3.Cursor) -> None:
+        existing_columns = {
+            row[1]
+            for row in cursor.execute("PRAGMA table_info(emails)").fetchall()
+        }
+        for column_name, column_type in self.REQUIRED_COLUMNS.items():
+            if column_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE emails ADD COLUMN {column_name} {column_type}")
+                logging.info("Added missing column '%s' to emails table", column_name)
 
     def close(self) -> None:
         try:
@@ -171,16 +193,26 @@ class MailDB:
             logging.error("Error fetching emails: %s", exc)
             raise
 
-    def bulk_update_classification(self, updates: Iterable[tuple[int, str, str]]) -> None:
+    def bulk_update_classification(self, updates: Iterable[tuple[int, str, str, float, str, str]]) -> None:
         try:
             cursor = self.conn.cursor()
             cursor.executemany(
                 """
                 UPDATE emails
-                SET processed_category = ?, processed_flag = ?
+                SET processed_category = ?, processed_flag = ?, spam_score = ?, spam_label = ?, spam_reasons = ?
                 WHERE id = ?
                 """,
-                ((category, flag, email_id) for email_id, category, flag in updates),
+                (
+                    (
+                        category,
+                        flag,
+                        spam_score,
+                        spam_label,
+                        spam_reasons,
+                        email_id,
+                    )
+                    for email_id, category, flag, spam_score, spam_label, spam_reasons in updates
+                ),
             )
             self.conn.commit()
             logging.info("Updated classification metadata for %s emails", cursor.rowcount)
