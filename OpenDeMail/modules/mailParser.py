@@ -1,86 +1,95 @@
-import OpenDeMail.modules.mailClient as mailClient
-import logging
 import email
+import logging
 import re
+from email import policy
+from typing import Any
+
 
 class MailParser:
-    def __init__(self, mail_client: mailClient.MailClient):
+    def __init__(self, mail_client) -> None:
         self.mail_client = mail_client
 
-    #get lastest email from the inbox
-    def get_latest_email(self)-> bytes:
+    @staticmethod
+    def _message_headers_to_dict(message) -> dict[str, Any]:
+        headers: dict[str, Any] = {}
+        for key, value in message.raw_items():
+            if key in headers:
+                existing = headers[key]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    headers[key] = [existing, value]
+            else:
+                headers[key] = value
+        return headers
+
+    def get_latest_email(self) -> bytes:
         mail = self.mail_client
         mail.select("INBOX")
         try:
-            result, data = mail.search(None, "ALL")
+            _, data = mail.search(None, "ALL")
             mail_ids = data[0].split()
+            if not mail_ids:
+                return b""
             latest_email_id = mail_ids[-1]
-            result, data = mail.fetch(latest_email_id, "(RFC822)")
-            raw_email = data[0][1]
-        except Exception as e:
-            logging.error(f"Error searching emails: {e}")
+            _, data = mail.fetch(latest_email_id, "(RFC822)")
+            return data[0][1]
+        except Exception as exc:
+            logging.error("Error fetching latest email: %s", exc)
             return b""
-        return raw_email
-    
-    def get_total_emails(self)-> int:
+
+    def get_total_emails(self) -> int:
         mail = self.mail_client
         mail.select("INBOX")
         try:
-            result, data = mail.search(None, "ALL")
+            _, data = mail.search(None, "ALL")
             mail_ids = data[0].split()
             return len(mail_ids)
-        except Exception as e:
-            logging.error(f"Error getting total emails: {e}")
+        except Exception as exc:
+            logging.error("Error getting total emails: %s", exc)
             return 0
-    
 
-    # fetch all email headers from inbox and return as a list of dictionaries
     def fetch_headers(self, raw_email: bytes) -> dict:
         try:
-            email_message = email.message_from_bytes(raw_email)
-            headers = dict(email_message.items())
-            return headers
-        except Exception as e:
-            logging.error(f"Error fetching email headers: {e}")
+            email_message = email.message_from_bytes(raw_email, policy=policy.default)
+            return self._message_headers_to_dict(email_message)
+        except Exception as exc:
+            logging.error("Error fetching email headers: %s", exc)
             return {}
-        
-    #fetch all email headers from inbox and return as a list of dictionaries
-    def fetch_all_headers(self) -> list:
-        m = self.mail_client
-        m.select("INBOX")
+
+    def fetch_all_headers(self) -> list[dict]:
+        mail = self.mail_client
+        mail.select("INBOX")
         try:
-            result, data = m.search(None, "ALL")
+            _, data = mail.search(None, "ALL")
             mail_ids = data[0].split()
             if not mail_ids:
                 return []
 
-            # fetch headers for all messages in a single command
             msg_set = b",".join(mail_ids)
-            result, data = m.fetch(msg_set, "(RFC822.HEADER)")
+            _, data = mail.fetch(msg_set, "(RFC822.HEADER)")
             headers_list = []
-            for resp in data:
-                if isinstance(resp, tuple):
-                    msg = email.message_from_bytes(resp[1])
-                    headers_list.append(dict(msg.items()))
+            for response in data:
+                if isinstance(response, tuple):
+                    msg = email.message_from_bytes(response[1], policy=policy.default)
+                    headers_list.append(self._message_headers_to_dict(msg))
             return headers_list
-
-        except Exception as e:
-            logging.error(f"Error fetching all email headers: {e}")
+        except Exception as exc:
+            logging.error("Error fetching all email headers: %s", exc)
             return []
-    
-    #Apply regex to "From" key where the sender email is store between "<" and ">" and check if it matches the sender_email in a nested dictionary of headers and return the list of records that match the sender email
-    def filter_by_sender(self, headers: dict, sender_email: str) -> bool:
+
+    def filter_by_sender(self, headers: list[dict], sender_email: str):
         try:
             filtered_headers = {}
             sender_pattern = re.compile(r"<([^>]+)>")
             for header in headers:
                 from_field = header.get("From", "")
+                if isinstance(from_field, list):
+                    from_field = from_field[0]
                 match = sender_pattern.search(from_field)
-                if match and match.group(1) == sender_email:
-                    # return True
+                if match and match.group(1).lower() == sender_email.lower():
                     filtered_headers[header.get("Subject", "No Subject")] = header
             return filtered_headers if filtered_headers else False
-            # return False
-        except Exception as e:
-            logging.error(f"Error filtering by sender: {e}")
+        except Exception as exc:
+            logging.error("Error filtering by sender: %s", exc)
             return False
