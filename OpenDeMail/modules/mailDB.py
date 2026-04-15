@@ -51,6 +51,18 @@ class MailDB:
     );
     """
 
+    CREATE_REVIEW_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS review_labels (
+        email_id INTEGER PRIMARY KEY,
+        ground_truth_label TEXT NOT NULL,
+        review_notes TEXT,
+        reviewed_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (email_id) REFERENCES emails (id)
+    );
+    """
+
     REQUIRED_COLUMNS = {
         "processed_category": "TEXT",
         "processed_flag": "TEXT",
@@ -69,10 +81,11 @@ class MailDB:
             cursor = self.conn.cursor()
             cursor.execute(self.CREATE_TABLE_IF_NOT_EXISTS_SQL)
             self._ensure_required_columns(cursor)
+            cursor.execute(self.CREATE_REVIEW_TABLE_SQL)
             self.conn.commit()
-            logging.info("Database table ready: %s", self.db_name)
+            logging.info("Database tables ready: %s", self.db_name)
         except sqlite3.Error as exc:
-            logging.error("Error creating database table: %s", exc)
+            logging.error("Error creating database tables: %s", exc)
             raise
 
     def _ensure_required_columns(self, cursor: sqlite3.Cursor) -> None:
@@ -219,3 +232,25 @@ class MailDB:
         except sqlite3.Error as exc:
             logging.error("Error updating classification metadata: %s", exc)
             raise
+
+    def bulk_upsert_manual_reviews(self, reviews: Iterable[tuple[int, str, str, str]]) -> None:
+        try:
+            cursor = self.conn.cursor()
+            cursor.executemany(
+                """
+                INSERT INTO review_labels (email_id, ground_truth_label, review_notes, reviewed_at, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(email_id) DO UPDATE SET
+                    ground_truth_label = excluded.ground_truth_label,
+                    review_notes = excluded.review_notes,
+                    reviewed_at = excluded.reviewed_at,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                reviews,
+            )
+            self.conn.commit()
+            logging.info("Upserted %s manual review rows", cursor.rowcount)
+        except sqlite3.Error as exc:
+            logging.error("Error upserting manual reviews: %s", exc)
+            raise
+
